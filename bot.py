@@ -30,7 +30,8 @@ class Config:
 
     # Static settings
     DB_FILE: str = 'ig_users.db'
-    COOKIES_FILE: str = "instagram_cookies.txt"
+    # The cookie file is now generic for all platforms
+    COOKIES_FILE: str = "cookies.txt"
     DOWNLOAD_DIR: str = tempfile.gettempdir()
     SHORTENER_API_URL: str = "https://shrinkearn.com/api"
     ACCESS_DURATION_HOURS: int = 24
@@ -276,6 +277,8 @@ class TelegramBot:
         err_str = str(e).lower()
         logger.warning(f"DownloadError for user {user_id}: {err_str}")
         
+        if "sign in to confirm" in err_str or "not a bot" in err_str:
+            return "🤖 **Bot-Check Failed**\nYouTube is asking to verify that you're not a bot. The admin needs to provide a `cookies.txt` file to solve this."
         if "login required" in err_str or "private" in err_str:
             return "🔒 **Private Content**\nThis content is private and requires a login session to download. The admin needs to provide a cookie file."
         if "age-restricted" in err_str or "18 years old" in err_str:
@@ -345,9 +348,10 @@ class TelegramBot:
             return
         try:
             file = await context.bot.get_file(update.message.document.file_id)
+            # The file should be named cookies.txt now
             await file.download_to_drive(self.config.COOKIES_FILE)
             if self.downloader._validate_cookies(self.config.COOKIES_FILE):
-                await update.message.reply_text("✅ **Cookies updated successfully!**")
+                await update.message.reply_text("✅ **Cookies updated successfully!** This will be used for all platforms.")
                 logger.info(f"Cookies file updated by admin.")
             else:
                 os.remove(self.config.COOKIES_FILE)
@@ -363,7 +367,7 @@ class TelegramBot:
         """Actions to run after initialization but before polling starts."""
         await self._notify_admin("🔔 Bot is starting up...")
         if not self.downloader._validate_cookies(self.config.COOKIES_FILE):
-            await self._notify_admin("⚠️ **Warning:** `cookies.txt` is missing or invalid. Private or age-restricted content may fail to download.")
+            await self._notify_admin("⚠️ **Warning:** `cookies.txt` is missing or invalid. Private or restricted content may fail to download.")
 
     async def _notify_admin(self, text: str):
         if not self.config.ADMIN_ID:
