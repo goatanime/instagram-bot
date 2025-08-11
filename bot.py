@@ -18,6 +18,8 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 from telegram.error import TelegramError
+# --- Add this import for specific error handling ---
+from yt_dlp.utils import DownloadError
 
 # --- Configuration ---
 
@@ -30,8 +32,11 @@ class Config:
 
     # Static settings
     DB_FILE: str = 'ig_users.db'
-    # The cookie file is now generic for all platforms
-    COOKIES_FILE: str = "cookies.txt"
+    # Platform-specific cookie files for better authentication
+    INSTAGRAM_COOKIES_FILE: str = "instagram_cookies.txt"
+    YOUTUBE_COOKIES_FILE: str = "youtube_cookies.txt"
+    FACEBOOK_COOKIES_FILE: str = "facebook_cookies.txt"
+    
     DOWNLOAD_DIR: str = tempfile.gettempdir()
     SHORTENER_API_URL: str = "https://shrinkearn.com/api"
     ACCESS_DURATION_HOURS: int = 24
@@ -107,13 +112,15 @@ class Database:
 
 class MediaDownloader:
     """Manages media downloads from multiple platforms using yt-dlp."""
-    # Combined regex for Instagram, Facebook, and YouTube
     _URL_PATTERN = re.compile(
         r'https?://(?:www\.)?'
         r'(?:'
+        # Instagram
         r'instagram\.com/(?:p|reel|tv|stories|explore/tags)/[a-zA-Z0-9_.-]+(?:/[0-9]+)?|'
         r'instagram\.com/[a-zA-Z0-9_.-]+/?|'
-        r'(?:m\.|web\.)?facebook\.com/(?:watch/?|reel/|[a-zA-Z0-9_.-]+/videos/|[a-zA-Z0-9_.-]+/posts/|video\.php\?v=)[0-9a-zA-Z_.-]+|'
+        # Facebook
+        r'facebook\.com/(?:watch/?|reel/|share/|video\.php|[a-zA-Z0-9_.-]+/videos/|[a-zA-Z0-9_.-]+/posts/)[a-zA-Z0-9_.-/?=&]+|'
+        # YouTube
         r'youtube\.com/(?:watch\?v=|shorts/)[a-zA-Z0-9_-]{11}|'
         r'youtu\.be/[a-zA-Z0-9_-]{11}'
         r')'
@@ -125,33 +132,55 @@ class MediaDownloader:
 
     @staticmethod
     def _validate_cookies(file_path: str) -> bool:
-        if not os.path.exists(file_path) or os.path.getsize(file_path) < 100:
+        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
             return False
         with open(file_path, 'r', encoding='utf-8') as f:
-            return f.readline().strip().startswith(("# HTTP Cookie File", "# Netscape HTTP Cookie File"))
+            # Check for a more robust sign of a valid cookie file
+            content = f.read(100)
+            return content.strip().startswith(("# HTTP Cookie File", "# Netscape HTTP Cookie File"))
 
     def download_media(self, url: str, user_id: int) -> Tuple[List[str], str]:
         temp_dir = tempfile.mkdtemp(prefix=f"media_{user_id}_", dir=Config.DOWNLOAD_DIR)
-        cookies_file = Config.COOKIES_FILE if self._validate_cookies(Config.COOKIES_FILE) else None
+        
+        cookies_file = None
+        is_instagram = 'instagram.com' in url
+        if is_instagram:
+            cookies_file = Config.INSTAGRAM_COOKIES_FILE if self._validate_cookies(Config.INSTAGRAM_COOKIES_FILE) else None
+        elif 'youtube.com' in url or 'youtu.be' in url:
+            cookies_file = Config.YOUTUBE_COOKIES_FILE if self._validate_cookies(Config.YOUTUBE_COOKIES_FILE) else None
+        elif 'facebook.com' in url:
+            cookies_file = Config.FACEBOOK_COOKIES_FILE if self._validate_cookies(Config.FACEBOOK_COOKIES_FILE) else None
+        
         if not cookies_file:
-            logger.warning("Cookies file not found or invalid. Private content may fail.")
+            logger.warning(f"No valid cookie file found for URL: {url}")
 
         ydl_opts = {
             'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-            'format': 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best',
             'cookiefile': cookies_file,
-            'ignoreerrors': False, 'quiet': True, 'no_warnings': True,
-            'retries': 3, 'fragment_retries': 3,
+            'ignoreerrors': False,
+            'quiet': True,
+            'no_warnings': True,
+            'retries': 3,
+            'fragment_retries': 3,
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
                 'Accept-Language': 'en-US,en;q=0.9',
             },
-            'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
-            'max_filesize': '50m', # Set max filesize to avoid Telegram limit issues
+            'max_filesize': 52428800, # 50 MB
         }
+
+        # --- THE FIX: Only specify format for non-Instagram links ---
+        # This allows yt-dlp to download images/carousels from Instagram by default.
+        if not is_instagram:
+            ydl_opts['format'] = 'best'
+            ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
+
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.extract_info(url, download=True)
+        except DownloadError as e:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise e
         except Exception as e:
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise e
@@ -159,7 +188,7 @@ class MediaDownloader:
         downloaded_files = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir)]
         if not downloaded_files:
             shutil.rmtree(temp_dir, ignore_errors=True)
-            raise ValueError("yt-dlp completed but no files were found.")
+            raise ValueError("Download failed: No media files were found after processing the link.")
         return downloaded_files, temp_dir
 
 
@@ -233,7 +262,10 @@ class TelegramBot:
             return
 
         if not self.downloader.is_valid_url(message_text):
-            await update.message.reply_text("❌ **Invalid URL**\nPlease send a valid link from Instagram, Facebook, or YouTube.", parse_mode='Markdown')
+            await update.message.reply_text(
+                "❌ **Invalid or Unsupported URL**\n\nPlease send a direct link to a Reel, Short, Video, or Image from Instagram, Facebook, or YouTube.",
+                parse_mode='Markdown'
+            )
             return
             
         if not self.db.has_valid_access(user_id):
@@ -261,14 +293,10 @@ class TelegramBot:
             
             await context.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id)
 
-        except yt_dlp.utils.DownloadError as e:
-            error_message = self._handle_download_error(e, user_id)
-            await context.bot.edit_message_text(error_message, chat_id=msg.chat_id, message_id=msg.message_id, parse_mode='Markdown')
-            if "login" in str(e).lower() or "cookies" in str(e).lower() or "restricted" in str(e).lower():
-                await self._notify_admin(f"⚠️ A restricted video failed to download for user {user_id}. Cookies may be required.\n\n`{e}`")
         except Exception as e:
             logger.error(f"Unexpected error for user {user_id}: {e}", exc_info=True)
-            await context.bot.edit_message_text("❌ An unexpected error occurred.", chat_id=msg.chat_id, message_id=msg.message_id)
+            error_message = self._handle_download_error(e, user_id)
+            await context.bot.edit_message_text(error_message, chat_id=msg.chat_id, message_id=msg.message_id, parse_mode='Markdown')
         finally:
             if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -277,12 +305,17 @@ class TelegramBot:
         err_str = str(e).lower()
         logger.warning(f"DownloadError for user {user_id}: {err_str}")
         
+        if "no video formats found" in err_str:
+            return "🤔 **No Video Found**\nThis link might be for an image-only post, a private account, or an expired story. If it's private, the admin needs to provide a valid `instagram_cookies.txt` file."
+        
+        if "no media files were found" in err_str:
+            return "❌ **Download Failed**\nCould not retrieve any media from the provided link. The content might be private, deleted, or from an unsupported format."
         if "sign in to confirm" in err_str or "not a bot" in err_str:
-            return "🤖 **Bot-Check Failed**\nYouTube is asking to verify that you're not a bot. The admin needs to provide a `cookies.txt` file to solve this."
+            return "🤖 **Bot-Check Failed**\nYouTube is asking to verify that you're not a bot. The admin needs to provide a `youtube_cookies.txt` file to solve this."
         if "login required" in err_str or "private" in err_str:
-            return "🔒 **Private Content**\nThis content is private and requires a login session to download. The admin needs to provide a cookie file."
+            return "🔒 **Private Content**\nThis content is private and requires a login session to download. The admin needs to provide a cookie file for the specific platform."
         if "age-restricted" in err_str or "18 years old" in err_str:
-            return "🔞 **Age-Restricted Content**\nThis video can't be downloaded because it's marked as 18+. The admin needs to provide a logged-in session."
+            return "🔞 **Age-Restricted Content**\nThis video can't be downloaded because it's marked as 18+. The admin needs to provide a logged-in session for the specific platform."
         if "file is larger than the 50.00mib limit" in err_str:
             return "📦 **File Too Large**\nThis video is larger than 50MB and cannot be sent on Telegram."
         if "429" in err_str or "too many requests" in err_str:
@@ -343,21 +376,44 @@ class TelegramBot:
     async def handle_cookie_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != self.config.ADMIN_ID:
             return
-        if not update.message.document or not update.message.document.file_name.endswith('.txt'):
+        
+        doc = update.message.document
+        if not doc or not doc.file_name.endswith('.txt'):
             await update.message.reply_text("Please upload the cookie file as a `.txt` document.")
             return
+
+        file_name = doc.file_name.lower()
+        target_path = None
+        platform_name = "Unknown"
+
+        if "instagram" in file_name:
+            target_path = self.config.INSTAGRAM_COOKIES_FILE
+            platform_name = "Instagram"
+        elif "youtube" in file_name:
+            target_path = self.config.YOUTUBE_COOKIES_FILE
+            platform_name = "YouTube"
+        elif "facebook" in file_name:
+            target_path = self.config.FACEBOOK_COOKIES_FILE
+            platform_name = "Facebook"
+        else:
+            await update.message.reply_text(
+                "❌ **Unknown Cookie File**\n"
+                "Please name your file `instagram_cookies.txt`, `youtube_cookies.txt`, or `facebook_cookies.txt`."
+            )
+            return
+
         try:
-            file = await context.bot.get_file(update.message.document.file_id)
-            # The file should be named cookies.txt now
-            await file.download_to_drive(self.config.COOKIES_FILE)
-            if self.downloader._validate_cookies(self.config.COOKIES_FILE):
-                await update.message.reply_text("✅ **Cookies updated successfully!** This will be used for all platforms.")
-                logger.info(f"Cookies file updated by admin.")
+            file = await context.bot.get_file(doc.file_id)
+            await file.download_to_drive(target_path)
+            
+            if self.downloader._validate_cookies(target_path):
+                await update.message.reply_text(f"✅ **{platform_name} cookies updated successfully!**")
+                logger.info(f"{platform_name} cookies file updated by admin.")
             else:
-                os.remove(self.config.COOKIES_FILE)
-                await update.message.reply_text("❌ **Invalid Cookies File**.")
+                os.remove(target_path)
+                await update.message.reply_text(f"❌ **Invalid {platform_name} Cookies File**.")
         except Exception as e:
-            logger.error(f"Failed to update cookie file: {e}")
+            logger.error(f"Failed to update {platform_name} cookie file: {e}")
             await update.message.reply_text(f"❌ Error updating cookies: {e}")
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -366,8 +422,12 @@ class TelegramBot:
     async def post_init(self, application: Application):
         """Actions to run after initialization but before polling starts."""
         await self._notify_admin("🔔 Bot is starting up...")
-        if not self.downloader._validate_cookies(self.config.COOKIES_FILE):
-            await self._notify_admin("⚠️ **Warning:** `cookies.txt` is missing or invalid. Private or restricted content may fail to download.")
+        if not self.downloader._validate_cookies(self.config.INSTAGRAM_COOKIES_FILE):
+            await self._notify_admin("⚠️ **Warning:** `instagram_cookies.txt` is missing or invalid.")
+        if not self.downloader._validate_cookies(self.config.YOUTUBE_COOKIES_FILE):
+            await self._notify_admin("⚠️ **Warning:** `youtube_cookies.txt` is missing or invalid.")
+        if not self.downloader._validate_cookies(self.config.FACEBOOK_COOKIES_FILE):
+            await self._notify_admin("⚠️ **Warning:** `facebook_cookies.txt` is missing or invalid.")
 
     async def _notify_admin(self, text: str):
         if not self.config.ADMIN_ID:
