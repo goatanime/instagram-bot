@@ -140,6 +140,8 @@ class InstagramDownloader:
             'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
         }
         try:
+            # yt-dlp is a synchronous library, so we run it in a separate thread
+            # to avoid blocking the main asyncio event loop.
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.extract_info(url, download=True)
         except Exception as e:
@@ -209,8 +211,14 @@ class TelegramBot:
             )
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        This is the entry point for user messages. It performs initial checks
+        and then creates a background task to handle the download, allowing the
+        bot to remain responsive to other users.
+        """
         user_id = update.effective_user.id
         url = update.message.text.strip()
+
         if not self.downloader.is_valid_url(url):
             await update.message.reply_text("❌ **Invalid URL**\nPlease send a valid Instagram URL.", parse_mode='Markdown')
             return
@@ -225,12 +233,28 @@ class TelegramBot:
             )
             return
 
+        # Create a background task to process the download.
+        # This allows the bot to handle new messages immediately.
+        asyncio.create_task(self.process_download_task(update, context, url))
+
+    async def process_download_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
+        """
+        This function runs in the background for each user request. It handles
+        the entire download, processing, and sending flow.
+        """
+        user_id = update.effective_user.id
         msg = await update.message.reply_text("⏬ Downloading, please wait...")
         temp_dir = None
         try:
+            # Run the synchronous download function in a separate thread
             files, temp_dir = await asyncio.to_thread(self.downloader.download_media, url, user_id)
+            
             await context.bot.edit_message_text("✅ Download complete! Sending media...", chat_id=msg.chat_id, message_id=msg.message_id)
             await self._send_media(update, context, files)
+            
+            # After sending, delete the original "Downloading..." message
+            await context.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id)
+
         except yt_dlp.utils.DownloadError as e:
             error_message = self._handle_download_error(e, user_id)
             await context.bot.edit_message_text(error_message, chat_id=msg.chat_id, message_id=msg.message_id, parse_mode='Markdown')
