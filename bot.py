@@ -102,17 +102,25 @@ class Database:
             logger.info("Database connection closed.")
 
 
-# --- Instagram Downloader ---
+# --- Media Downloader ---
 
-class InstagramDownloader:
-    """Manages media downloads using yt-dlp."""
+class MediaDownloader:
+    """Manages media downloads from multiple platforms using yt-dlp."""
+    # Combined regex for Instagram, Facebook, and YouTube
     _URL_PATTERN = re.compile(
-        r'https?://(?:www\.)?instagram\.com/(?:p|reel|tv|stories|explore/tags)/[a-zA-Z0-9_.-]+(?:/[0-9]+)?|https?://(?:www\.)?instagram\.com/[a-zA-Z0-9_.-]+/?'
+        r'https?://(?:www\.)?'
+        r'(?:'
+        r'instagram\.com/(?:p|reel|tv|stories|explore/tags)/[a-zA-Z0-9_.-]+(?:/[0-9]+)?|'
+        r'instagram\.com/[a-zA-Z0-9_.-]+/?|'
+        r'(?:m\.|web\.)?facebook\.com/(?:watch/?|reel/|[a-zA-Z0-9_.-]+/videos/|[a-zA-Z0-9_.-]+/posts/|video\.php\?v=)[0-9a-zA-Z_.-]+|'
+        r'youtube\.com/(?:watch\?v=|shorts/)[a-zA-Z0-9_-]{11}|'
+        r'youtu\.be/[a-zA-Z0-9_-]{11}'
+        r')'
     )
 
     @staticmethod
     def is_valid_url(url: str) -> bool:
-        return bool(InstagramDownloader._URL_PATTERN.match(url))
+        return bool(MediaDownloader._URL_PATTERN.match(url))
 
     @staticmethod
     def _validate_cookies(file_path: str) -> bool:
@@ -122,14 +130,14 @@ class InstagramDownloader:
             return f.readline().strip().startswith(("# HTTP Cookie File", "# Netscape HTTP Cookie File"))
 
     def download_media(self, url: str, user_id: int) -> Tuple[List[str], str]:
-        temp_dir = tempfile.mkdtemp(prefix=f"ig_{user_id}_", dir=Config.DOWNLOAD_DIR)
+        temp_dir = tempfile.mkdtemp(prefix=f"media_{user_id}_", dir=Config.DOWNLOAD_DIR)
         cookies_file = Config.COOKIES_FILE if self._validate_cookies(Config.COOKIES_FILE) else None
         if not cookies_file:
             logger.warning("Cookies file not found or invalid. Private content may fail.")
 
         ydl_opts = {
             'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best',
             'cookiefile': cookies_file,
             'ignoreerrors': False, 'quiet': True, 'no_warnings': True,
             'retries': 3, 'fragment_retries': 3,
@@ -138,10 +146,9 @@ class InstagramDownloader:
                 'Accept-Language': 'en-US,en;q=0.9',
             },
             'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
+            'max_filesize': '50m', # Set max filesize to avoid Telegram limit issues
         }
         try:
-            # yt-dlp is a synchronous library, so we run it in a separate thread
-            # to avoid blocking the main asyncio event loop.
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.extract_info(url, download=True)
         except Exception as e:
@@ -162,7 +169,7 @@ class TelegramBot:
     def __init__(self, config: Config):
         self.config = config
         self.db = Database(config.DB_FILE)
-        self.downloader = InstagramDownloader()
+        self.downloader = MediaDownloader()
         self.application = Application.builder().token(config.BOT_TOKEN).build()
         self.http_client = httpx.AsyncClient(timeout=10.0)
         self._register_handlers()
@@ -192,42 +199,40 @@ class TelegramBot:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         logger.info(f"/start command from user {user.id} ({user.username})")
+        start_message = (
+            "🌟 **Welcome to the All-in-One Media Downloader!**\n\n"
+            "Send me a link from Instagram, Facebook, or YouTube, and I'll download it for you.\n\n"
+            "Supported content: Reels, Shorts, Videos, and Images."
+        )
         if context.args and context.args[0] == "shorte":
             self.db.grant_access(user.id)
             await update.message.reply_text(
-                f"🎉 **Premium Access Activated!**\n\nYour free access is valid for {self.config.ACCESS_DURATION_HOURS} hours.",
+                f"🎉 **Premium Access Activated!**\n\nYour free access is valid for {self.config.ACCESS_DURATION_HOURS} hours.\n\n{start_message}",
                 parse_mode='Markdown'
             )
         elif self.db.has_valid_access(user.id):
-            await update.message.reply_text("🌟 **Welcome back!**\nYour access is active.", parse_mode='Markdown')
+            await update.message.reply_text(f"✅ **Welcome back!**\nYour access is active.\n\n{start_message}", parse_mode='Markdown')
         else:
             bot_username = (await context.bot.get_me()).username
             short_url = await self._generate_short_url(bot_username)
             keyboard = [[InlineKeyboardButton("🔥 GET FREE ACCESS 🔥", url=short_url)]]
             await update.message.reply_text(
-                "🔒 **Premium Access Required**\nClick the button below to activate your free 24-hour access.",
+                f"🔒 **Premium Access Required**\n\n{start_message}\n\nFirst, click the button below to activate your free 24-hour access.",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        This is the entry point for user messages. It performs initial checks
-        and then creates a background task to handle the download, allowing the
-        bot to remain responsive to other users.
-        """
         user_id = update.effective_user.id
         message_text = update.message.text.strip()
 
-        # --- Admin Cheat Code for Testing ---
         if message_text == "9434" and user_id == self.config.ADMIN_ID:
             self.db.grant_access(user_id)
             await update.message.reply_text("✅ **Admin Bypass:** Access granted for 24 hours.")
-            return # Stop further processing
+            return
 
-        # --- Regular URL Processing ---
         if not self.downloader.is_valid_url(message_text):
-            await update.message.reply_text("❌ **Invalid URL**\nPlease send a valid Instagram URL.", parse_mode='Markdown')
+            await update.message.reply_text("❌ **Invalid URL**\nPlease send a valid link from Instagram, Facebook, or YouTube.", parse_mode='Markdown')
             return
             
         if not self.db.has_valid_access(user_id):
@@ -241,33 +246,25 @@ class TelegramBot:
             )
             return
 
-        # Create a background task to process the download.
-        # This allows the bot to handle new messages immediately.
         asyncio.create_task(self.process_download_task(update, context, message_text))
 
     async def process_download_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-        """
-        This function runs in the background for each user request. It handles
-        the entire download, processing, and sending flow.
-        """
         user_id = update.effective_user.id
         msg = await update.message.reply_text("⏬ Downloading, please wait...")
         temp_dir = None
         try:
-            # Run the synchronous download function in a separate thread
             files, temp_dir = await asyncio.to_thread(self.downloader.download_media, url, user_id)
             
             await context.bot.edit_message_text("✅ Download complete! Sending media...", chat_id=msg.chat_id, message_id=msg.message_id)
             await self._send_media(update, context, files)
             
-            # After sending, delete the original "Downloading..." message
             await context.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id)
 
         except yt_dlp.utils.DownloadError as e:
             error_message = self._handle_download_error(e, user_id)
             await context.bot.edit_message_text(error_message, chat_id=msg.chat_id, message_id=msg.message_id, parse_mode='Markdown')
-            if "login" in str(e).lower() or "cookies" in str(e).lower() or "restricted video" in str(e).lower():
-                await self._notify_admin(f"⚠️ Cookies might be invalid or insufficient. User {user_id} triggered an error.\n\n`{e}`")
+            if "login" in str(e).lower() or "cookies" in str(e).lower() or "restricted" in str(e).lower():
+                await self._notify_admin(f"⚠️ A restricted video failed to download for user {user_id}. Cookies may be required.\n\n`{e}`")
         except Exception as e:
             logger.error(f"Unexpected error for user {user_id}: {e}", exc_info=True)
             await context.bot.edit_message_text("❌ An unexpected error occurred.", chat_id=msg.chat_id, message_id=msg.message_id)
@@ -279,12 +276,14 @@ class TelegramBot:
         err_str = str(e).lower()
         logger.warning(f"DownloadError for user {user_id}: {err_str}")
         
-        if "restricted video" in err_str or "18 years old" in err_str:
-            return "🔞 **Age-Restricted Content**\nThis video can't be downloaded because it's marked as 18+.\n\nThis is a limitation that only the bot's administrator can fix by providing a logged-in session."
-        if "login required" in err_str or "private profile" in err_str:
-            return "🔒 **Private Content**\nThis content is private or requires a login. The admin needs to provide a cookie file."
+        if "login required" in err_str or "private" in err_str:
+            return "🔒 **Private Content**\nThis content is private and requires a login session to download. The admin needs to provide a cookie file."
+        if "age-restricted" in err_str or "18 years old" in err_str:
+            return "🔞 **Age-Restricted Content**\nThis video can't be downloaded because it's marked as 18+. The admin needs to provide a logged-in session."
+        if "file is larger than the 50.00mib limit" in err_str:
+            return "📦 **File Too Large**\nThis video is larger than 50MB and cannot be sent on Telegram."
         if "429" in err_str or "too many requests" in err_str:
-            return "⏳ **Rate Limited**\nInstagram is limiting requests. Please try again later."
+            return "⏳ **Rate Limited**\nThe service is limiting requests. Please try again later."
         if "unsupported url" in err_str:
             return "🔗 **Unsupported URL**\nThis type of link is not supported."
         
@@ -364,7 +363,7 @@ class TelegramBot:
         """Actions to run after initialization but before polling starts."""
         await self._notify_admin("🔔 Bot is starting up...")
         if not self.downloader._validate_cookies(self.config.COOKIES_FILE):
-            await self._notify_admin("⚠️ **Warning:** `instagram_cookies.txt` is missing or invalid.")
+            await self._notify_admin("⚠️ **Warning:** `cookies.txt` is missing or invalid. Private or age-restricted content may fail to download.")
 
     async def _notify_admin(self, text: str):
         if not self.config.ADMIN_ID:
@@ -385,7 +384,7 @@ def main():
 
     bot.application.post_init = bot.post_init
 
-    logger.info("Instagram Content Downloader Bot is now running.")
+    logger.info("All-in-One Media Downloader Bot is now running.")
     
     bot.application.run_polling()
 
