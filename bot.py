@@ -217,11 +217,19 @@ class TelegramBot:
         bot to remain responsive to other users.
         """
         user_id = update.effective_user.id
-        url = update.message.text.strip()
+        message_text = update.message.text.strip()
 
-        if not self.downloader.is_valid_url(url):
+        # --- Admin Cheat Code for Testing ---
+        if message_text == "9434" and user_id == self.config.ADMIN_ID:
+            self.db.grant_access(user_id)
+            await update.message.reply_text("✅ **Admin Bypass:** Access granted for 24 hours.")
+            return # Stop further processing
+
+        # --- Regular URL Processing ---
+        if not self.downloader.is_valid_url(message_text):
             await update.message.reply_text("❌ **Invalid URL**\nPlease send a valid Instagram URL.", parse_mode='Markdown')
             return
+            
         if not self.db.has_valid_access(user_id):
             bot_username = (await context.bot.get_me()).username
             short_url = await self._generate_short_url(bot_username)
@@ -235,7 +243,7 @@ class TelegramBot:
 
         # Create a background task to process the download.
         # This allows the bot to handle new messages immediately.
-        asyncio.create_task(self.process_download_task(update, context, url))
+        asyncio.create_task(self.process_download_task(update, context, message_text))
 
     async def process_download_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
         """
