@@ -1,3 +1,4 @@
+from keep_alive import keep_alive
 import os
 import re
 import logging
@@ -455,8 +456,10 @@ def main():
 
 if __name__ == "__main__":
     try:
+        keep_alive()
         main()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot shutdown initiated.")
     except ValueError as e:
         logger.critical(e)
+
