@@ -5,7 +5,7 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "Facebook Video Downloader Bot is alive!"
+    return " Video Downloader Bot is alive!"
 
 def run():
     app.run(host='0.0.0.0', port=8080)
